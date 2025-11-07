@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     'teachers',
     'announcements',
     'payments',
+    'school',
 
     # Swagger/OpenAPI
     'drf_spectacular',

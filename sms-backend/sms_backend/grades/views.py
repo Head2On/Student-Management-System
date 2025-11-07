@@ -1,116 +1,162 @@
-from rest_framework import serializers, generics
-from rest_framework.permissions import IsAuthenticated
-from .models import Grade
-from .serializers import GradeSerializer
-from students.models import studentProfile
-from rest_framework.exceptions import PermissionDenied # Import this
+from rest_framework import viewsets, permissions, filters
+from rest_framework.response import Response
+from rest_framework.decorators import action
+from django.db.models import Sum, Avg
+from .permission import *
+from .models import (
+    AcademicYear, Exam, AssessmentType, GradeScale,
+    Enrollment, Mark, ResultSummary
+)
+from .serializers import (
+    AcademicYearSerializer, ExamSerializer, AssessmentTypeSerializer,
+    GradeScaleSerializer, EnrollmentSerializer, MarkSerializer, ResultSummarySerializer
+)
 
-class GradeListCreateView(generics.ListCreateAPIView):
-    # queryset = Grade.objects.all() # <-- REMOVE THIS LINE
-    serializer_class = GradeSerializer
-    permission_classes = [IsAuthenticated]
+from grades.services.recompute_results import (
+    recompute_ranks_for_exam, compute_cgpa_for_enrollment
+)
 
-    # ADD THIS FUNCTION
-    def get_queryset(self):
-        """
-        Filter grades based on the user's role.
-        """
-        user = self.request.user
 
-        if not hasattr(user, 'role'):
-            # Deny permission if user has no role
-            raise PermissionDenied("You do not have a role assigned.")
+# --- Master ViewSets (for admin or basic viewing) ---
 
-        if user.role == 'student':
-            # Students can only see their own grades
-            return Grade.objects.filter(student=user)
-        
-        elif user.role == 'teacher':
-            # Teachers can see grades for their courses
-            # You could also change this to Grade.objects.all() if you prefer
-            return Grade.objects.filter(course__teacher=user)
-        
-        elif user.role == 'admin':
-            # Admins can see all grades
-            return Grade.objects.all()
-        
-        # As a fallback, return nothing
-        return Grade.objects.none()
+class AcademicYearViewSet(viewsets.ModelViewSet):
+    queryset = AcademicYear.objects.all()
+    serializer_class = AcademicYearSerializer
+    permission_classes = [IsAdmin | ReadOnly]
+
+class ExamViewSet(viewsets.ModelViewSet):
+    queryset = Exam.objects.all().select_related("academic_year")
+    serializer_class = ExamSerializer
+    permission_classes = [IsAdmin | ReadOnly]
+
+
+class AssessmentTypeViewSet(viewsets.ModelViewSet):
+    queryset = AssessmentType.objects.all()
+    serializer_class = AssessmentTypeSerializer
+    permission_classes = [IsAdmin | ReadOnly]
+
+
+class GradeScaleViewSet(viewsets.ModelViewSet):
+    queryset = GradeScale.objects.select_related("academic_year").all()
+    serializer_class = GradeScaleSerializer
+    permission_classes = [IsAdmin | ReadOnly]
+
+
+# --- Enrollment (used by both teacher & student) ---
+
+class EnrollmentViewSet(viewsets.ModelViewSet):
+    queryset = Enrollment.objects.select_related("student", "academic_year", "classroom").all()
+    serializer_class = EnrollmentSerializer
+    permission_classes = [IsTeacherOrAdmin | ReadOnly]
+    filter_backends = [filters.SearchFilter]
+    search_fields = ["student__username", "admission_no"]
+
+
+# --- Mark CRUD (teacher/admin) ---
+
+class MarkViewSet(viewsets.ModelViewSet):
+    queryset = Mark.objects.select_related(
+        "enrollment__student", "subject", "exam", "assessment_type"
+    ).all()
+    serializer_class = MarkSerializer
+    permission_classes = [IsTeacherOrAdmin | ReadOnly]
 
     def perform_create(self, serializer):
-        user = self.request.user
+        serializer.save(created_by=self.request.user)
 
-        # We check the role here again for creation
-        if user.role not in ['teacher', 'admin']:
-            # Use PermissionDenied for permission issues
-            raise PermissionDenied("Only teachers or admins can assign grades.")
-
-        student_user = serializer.validated_data['student']  # this is a User object
-
-        try:
-            student_profile = studentProfile.objects.get(user=student_user)
-        except studentProfile.DoesNotExist:
-            raise serializers.ValidationError("This student does not have a studentProfile yet.")
-
-        course = serializer.validated_data['course']
-
-        if user.role == 'teacher' and course.teacher != user:
-            raise serializers.ValidationError("You can only assign grades for your own courses.")
-
-        if student_profile.course != course:
-            raise serializers.ValidationError("This student is not enrolled in the selected course.")
-
-        serializer.save()
-        # update the student's GPA
-        
-class GradeRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
-    # This view is fine, but the queryset also needs to be dynamic
-    # queryset = Grade.objects.all() # <-- REMOVE THIS LINE
-    serializer_class = GradeSerializer
-    permission_classes = [IsAuthenticated]
-
-    # ADD THIS FUNCTION
     def get_queryset(self):
-        """
-        Filter grades based on the user's role for detail view.
-        """
         user = self.request.user
+        qs = super().get_queryset()
+        if user.is_staff:
+            return qs  # admin sees all
+        if hasattr(user, "is_teacher") and user.is_teacher:
+            return qs  # later we’ll filter by teacher’s assigned subjects
+        # Student → only their marks
+        return qs.filter(enrollment__student=user)
 
-        if not hasattr(user, 'role'):
-            raise PermissionDenied("You do not have a role assigned.")
+# --- ResultSummary (for viewing computed results) ---
 
-        if user.role == 'student':
-            return Grade.objects.filter(student=user)
-        elif user.role == 'teacher':
-            return Grade.objects.filter(course__teacher=user)
-        elif user.role == 'admin':
-            return Grade.objects.all()
-        
-        return Grade.objects.none()
+class ResultSummaryViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = ResultSummary.objects.select_related(
+        "enrollment__student", "enrollment__classroom", "exam"
+    ).all()
+    serializer_class = ResultSummarySerializer
+    permission_classes = [IsStudentSelf | ReadOnly]
 
+    @action(detail=False, methods=["get"], permission_classes=[permissions.IsAuthenticated])
+    def my_results(self, request):
+        """For students: see their result summaries"""
+        student = request.user
+        results = ResultSummary.objects.filter(enrollment__student=student)
+        serializer = self.get_serializer(results, many=True)
+        return Response(serializer.data)
+    
 
-    def perform_update(self, serializer):
-        user = self.request.user
+    @action(detail=False, methods=["post"], permission_classes=[IsAdmin])
+    def recompute(self, request):
+        """Recompute results for an exam (admin only)"""
+        exam_id = request.data.get("exam_id")
+        if not exam_id:
+            return Response({"error": "exam_id required"}, status=400)
 
-        if user.role not in ['teacher', 'admin']:
-            raise PermissionDenied("Only teachers or admins can update grades.")
+        from grades.models import Enrollment, Exam
+        from grades.services.recompute_results import recompute_result_for_student_exam
 
-        grade_instance = self.get_object()
-        student_user = serializer.validated_data.get('student', grade_instance.student)
-        course = serializer.validated_data.get('course', grade_instance.course)
+        exam = Exam.objects.get(id=exam_id)
+        enrollments = Enrollment.objects.filter(academic_year=exam.academic_year)
+        count = 0
+        for e in enrollments:
+            recompute_result_for_student_exam(e, exam)
+            count += 1
 
-        try:
-            student_profile = studentProfile.objects.get(user=student_user)
-        except studentProfile.DoesNotExist:
-            raise serializers.ValidationError("This student does not have a StudentProfile yet.")
+        return Response({"status": f"Recomputed {count} results for {exam.name}"})
 
-        # This was 'course' but should be the validated data
-        validated_course = serializer.validated_data.get('course', grade_instance.course)
+    
+    @action(detail=False, methods=["post"], permission_classes=[IsAdmin])
+    def recompute_ranks(self, request):
+        """Recalculate ranks for a given exam"""
+        exam_id = request.data.get("exam_id")
+        if not exam_id:
+            return Response({"error": "exam_id required"}, status=400)
+        from grades.models import Exam
+        exam = Exam.objects.get(id=exam_id)
+        recompute_ranks_for_exam(exam)
+        return Response({"status": f"Ranks recomputed for {exam.name}"})
 
-        if user.role == 'teacher' and validated_course.teacher != user:
-            raise serializers.ValidationError("You can only update grades for your own courses.")
+    @action(detail=False, methods=["get"], permission_classes=[IsStudentSelf])
+    def my_cgpa(self, request):
+        """Get yearly CGPA for the logged-in student"""
+        enrollment = (
+            request.user.enrollments.filter(is_active=True).select_related("academic_year").first()
+        )
+        if not enrollment:
+            return Response({"error": "No active enrollment found"}, status=404)
 
-        if student_profile.course != validated_course:
-            raise serializers.ValidationError("This student is not enrolled in the selected course.")
+        cgpa = compute_cgpa_for_enrollment(enrollment)
+        return Response({"cgpa": cgpa})
 
-        serializer.save()
+    @action(detail=False, methods=["get"], permission_classes=[IsTeacherOrAdmin])
+    def top_students(self, request):
+        """Get top N students for a given exam (default 3)"""
+        exam_id = request.query_params.get("exam_id")
+        top_n = int(request.query_params.get("n", 3))
+        if not exam_id:
+            return Response({"error": "exam_id required"}, status=400)
+
+        results = (
+            ResultSummary.objects.filter(exam_id=exam_id)
+            .select_related("enrollment__student", "enrollment__classroom")
+            .order_by("-percentage")[:top_n]
+        )
+
+        data = [
+            {
+                "student": r.enrollment.student.username,
+                "classroom": r.enrollment.classroom.name,
+                "percentage": r.percentage,
+                "grade": r.grade_letter,
+                "rank": r.class_rank,
+            }
+            for r in results
+        ]
+        return Response(data)
